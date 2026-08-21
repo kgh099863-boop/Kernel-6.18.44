@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -19,31 +19,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc \
-            bison \
-            flex \
-            build-essential \
-            libssl-dev \
-            libelf-dev \
-            libncurses-dev \
-            dwarves \
-            cpio \
-            rsync \
-            kmod \
-            fakeroot \
+            bc bison flex build-essential \
+            libssl-dev libelf-dev libncurses-dev \
+            dwarves cpio rsync kmod fakeroot \
             crossbuild-essential-arm64
-
-      - name: Show toolchain
-        run: |
-          gcc --version
-          aarch64-linux-gnu-gcc --version
-          make --version
 
       - name: Prepare ARM64 config
         run: |
           make ARCH=arm64 defconfig
 
-      - name: Enable additional features
+      - name: Enable features
         run: |
           ./scripts/config --enable CONFIG_64BIT
           ./scripts/config --enable CONFIG_ARM64
@@ -51,110 +36,145 @@ jobs:
           ./scripts/config --enable CONFIG_PREEMPT
           ./scripts/config --enable CONFIG_MODULES
 
-          # Kernel debugging / symbols
           ./scripts/config --enable CONFIG_KALLSYMS
           ./scripts/config --enable CONFIG_KALLSYMS_ALL
           ./scripts/config --enable CONFIG_DEBUG_INFO
 
-          # Filesystems
           ./scripts/config --enable CONFIG_EXT4_FS
           ./scripts/config --enable CONFIG_F2FS_FS
           ./scripts/config --enable CONFIG_OVERLAY_FS
           ./scripts/config --enable CONFIG_VFAT_FS
 
-          # Networking
           ./scripts/config --enable CONFIG_NETFILTER
-          ./scripts/config --enable CONFIG_NETFILTER_XTABLES
           ./scripts/config --enable CONFIG_TCP_CONG_BBR
 
-          # BPF
           ./scripts/config --enable CONFIG_BPF
           ./scripts/config --enable CONFIG_BPF_SYSCALL
 
-          # Containers
           ./scripts/config --enable CONFIG_CGROUPS
           ./scripts/config --enable CONFIG_NAMESPACES
           ./scripts/config --enable CONFIG_SECCOMP
 
-          # Device mapper
           ./scripts/config --enable CONFIG_BLK_DEV_DM
-
-          # KVM
           ./scripts/config --enable CONFIG_KVM
 
           make ARCH=arm64 olddefconfig
 
-      - name: Show kernel configuration
-        run: |
-          echo "Kernel:"
-          make ARCH=arm64 kernelversion
-
-          echo "Architecture:"
-          grep CONFIG_ARCH .config | head -20 || true
-
-          echo "Important options:"
-          grep -E \
-            'CONFIG_(SMP|PREEMPT|MODULES|KALLSYMS|BPF|CGROUPS|NAMESPACES|SECCOMP|EXT4_FS|F2FS_FS|OVERLAY_FS|KVM)=' \
-            .config || true
-
-      - name: Build ARM64 Image
+      - name: Build Kernel Image
         run: |
           make -j"$(nproc)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             Image
 
-      - name: Build modules
+      - name: Build Modules
         run: |
           make -j"$(nproc)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             modules
 
-      - name: Build device trees
+      - name: Build DTBs
         run: |
           make -j"$(nproc)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             dtbs
 
-      - name: Prepare output
+      - name: Prepare files
         run: |
-          mkdir -p output/boot
-          mkdir -p output/modules
-          mkdir -p output/dtbs
+          mkdir -p release/kernel
+          mkdir -p release/modules
+          mkdir -p release/dtbs
+          mkdir -p release/config
 
-          cp arch/arm64/boot/Image output/boot/
-
-          if [ -d arch/arm64/boot/dts ]; then
-            find arch/arm64/boot/dts \
-              -type f \
-              \( -name '*.dtb' -o -name '*.dtbo' \) \
-              -exec cp --parents {} output/dtbs/ \;
-          fi
+          cp arch/arm64/boot/Image \
+            release/kernel/Image
 
           make ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            INSTALL_MOD_PATH="$PWD/output/modules" \
+            INSTALL_MOD_PATH="$PWD/release/modules" \
             modules_install
 
-          cp .config output/
+          find arch/arm64/boot/dts \
+            -type f \
+            \( -name '*.dtb' -o -name '*.dtbo' \) \
+            -exec cp --parents {} release/dtbs/ \; || true
 
-          cat > output/build-info.txt <<EOF
-          Kernel: $(make ARCH=arm64 kernelversion)
-          Architecture: arm64
-          Compiler: $(aarch64-linux-gnu-gcc --version | head -1)
-          Runner: ubuntu-24.04
-          Commit: $GITHUB_SHA
-          EOF
+          cp .config release/config/.config
 
-      - name: Compress output
-        run: |
-          tar -czf linux-6.18.44-arm64.tar.gz output
+          echo "Linux $(make ARCH=arm64 kernelversion)" \
+            > release/config/build-info.txt
 
-      - name: Upload kernel artifact
+      # -------------------------------
+      # Separate downloadable artifacts
+      # -------------------------------
+
+      - name: Upload Kernel Image
         uses: actions/upload-artifact@v4
         with:
-          name: linux-6.18.44-arm64
-          path: linux-6.18.44-arm64.tar.gz
+          name: Kernel-Image
+          path: release/kernel/Image
           retention-days: 7
+
+      - name: Compress Modules
+        run: |
+          tar -czf modules.tar.gz -C release/modules .
+
+      - name: Upload Modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Modules
+          path: modules.tar.gz
+          retention-days: 7
+
+      - name: Compress DTBs
+        run: |
+          tar -czf dtbs.tar.gz -C release/dtbs .
+
+      - name: Upload DTBs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-DTBS
+          path: dtbs.tar.gz
+          retention-days: 7
+
+      - name: Upload Config
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Config
+          path: release/config
+          retention-days: 7
+
+      # -------------------------------
+      # Full package
+      # -------------------------------
+
+      - name: Create Full Package
+        run: |
+          tar -czf kernel-full.tar.gz \
+            -C release .
+
+      - name: Upload Full Kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Full
+          path: kernel-full.tar.gz
+          retention-days: 7
+
+      # -------------------------------
+      # GitHub Release
+      # -------------------------------
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-6.18.44-arm64-${{ github.run_number }}
+          name: Linux 6.18.44 ARM64 Build ${{ github.run_number }}
+          generate_release_notes: true
+          files: |
+            release/kernel/Image
+            modules.tar.gz
+            dtbs.tar.gz
+            release/config/.config
+            kernel-full.tar.gz
