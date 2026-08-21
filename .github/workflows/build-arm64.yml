@@ -1,0 +1,160 @@
+name: Build Linux 6.18.44 ARM64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ARM64 Kernel
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            libssl-dev \
+            libelf-dev \
+            libncurses-dev \
+            dwarves \
+            cpio \
+            rsync \
+            kmod \
+            fakeroot \
+            crossbuild-essential-arm64
+
+      - name: Show toolchain
+        run: |
+          gcc --version
+          aarch64-linux-gnu-gcc --version
+          make --version
+
+      - name: Prepare ARM64 config
+        run: |
+          make ARCH=arm64 defconfig
+
+      - name: Enable additional features
+        run: |
+          ./scripts/config --enable CONFIG_64BIT
+          ./scripts/config --enable CONFIG_ARM64
+          ./scripts/config --enable CONFIG_SMP
+          ./scripts/config --enable CONFIG_PREEMPT
+          ./scripts/config --enable CONFIG_MODULES
+
+          # Kernel debugging / symbols
+          ./scripts/config --enable CONFIG_KALLSYMS
+          ./scripts/config --enable CONFIG_KALLSYMS_ALL
+          ./scripts/config --enable CONFIG_DEBUG_INFO
+
+          # Filesystems
+          ./scripts/config --enable CONFIG_EXT4_FS
+          ./scripts/config --enable CONFIG_F2FS_FS
+          ./scripts/config --enable CONFIG_OVERLAY_FS
+          ./scripts/config --enable CONFIG_VFAT_FS
+
+          # Networking
+          ./scripts/config --enable CONFIG_NETFILTER
+          ./scripts/config --enable CONFIG_NETFILTER_XTABLES
+          ./scripts/config --enable CONFIG_TCP_CONG_BBR
+
+          # BPF
+          ./scripts/config --enable CONFIG_BPF
+          ./scripts/config --enable CONFIG_BPF_SYSCALL
+
+          # Containers
+          ./scripts/config --enable CONFIG_CGROUPS
+          ./scripts/config --enable CONFIG_NAMESPACES
+          ./scripts/config --enable CONFIG_SECCOMP
+
+          # Device mapper
+          ./scripts/config --enable CONFIG_BLK_DEV_DM
+
+          # KVM
+          ./scripts/config --enable CONFIG_KVM
+
+          make ARCH=arm64 olddefconfig
+
+      - name: Show kernel configuration
+        run: |
+          echo "Kernel:"
+          make ARCH=arm64 kernelversion
+
+          echo "Architecture:"
+          grep CONFIG_ARCH .config | head -20 || true
+
+          echo "Important options:"
+          grep -E \
+            'CONFIG_(SMP|PREEMPT|MODULES|KALLSYMS|BPF|CGROUPS|NAMESPACES|SECCOMP|EXT4_FS|F2FS_FS|OVERLAY_FS|KVM)=' \
+            .config || true
+
+      - name: Build ARM64 Image
+        run: |
+          make -j"$(nproc)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+      - name: Build modules
+        run: |
+          make -j"$(nproc)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            modules
+
+      - name: Build device trees
+        run: |
+          make -j"$(nproc)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            dtbs
+
+      - name: Prepare output
+        run: |
+          mkdir -p output/boot
+          mkdir -p output/modules
+          mkdir -p output/dtbs
+
+          cp arch/arm64/boot/Image output/boot/
+
+          if [ -d arch/arm64/boot/dts ]; then
+            find arch/arm64/boot/dts \
+              -type f \
+              \( -name '*.dtb' -o -name '*.dtbo' \) \
+              -exec cp --parents {} output/dtbs/ \;
+          fi
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$PWD/output/modules" \
+            modules_install
+
+          cp .config output/
+
+          cat > output/build-info.txt <<EOF
+          Kernel: $(make ARCH=arm64 kernelversion)
+          Architecture: arm64
+          Compiler: $(aarch64-linux-gnu-gcc --version | head -1)
+          Runner: ubuntu-24.04
+          Commit: $GITHUB_SHA
+          EOF
+
+      - name: Compress output
+        run: |
+          tar -czf linux-6.18.44-arm64.tar.gz output
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-6.18.44-arm64
+          path: linux-6.18.44-arm64.tar.gz
+          retention-days: 7
