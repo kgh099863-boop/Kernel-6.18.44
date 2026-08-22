@@ -1,28 +1,62 @@
-- name: Run Alpine on QEMU/KVM
-  shell: bash
-  run: |
-    set -euxo pipefail
+name: Alpine KVM Boot Benchmark
 
-    sudo apt-get update
-    sudo apt-get install -y qemu-system-x86 qemu-utils curl
+on:
+  workflow_dispatch:
 
-    curl -L -o alpine.iso \
-      https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-virt-3.22.0-x86_64.iso
+jobs:
+  boot:
+    runs-on: ubuntu-latest
 
-    START=$(date +%s%3N)
+    steps:
+      - name: Check KVM
+        run: |
+          set -eux
+          test -e /dev/kvm
+          ls -l /dev/kvm
+          kvm-ok || true
 
-    sudo timeout 30s qemu-system-x86_64 \
-      -enable-kvm \
-      -cpu host \
-      -m 512 \
-      -smp 2 \
-      -drive file=alpine.qcow2,if=virtio,format=qcow2 \
-      -cdrom alpine.iso \
-      -nographic \
-      -serial mon:stdio \
-      -no-reboot \
-      -accel kvm
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils
 
-    END=$(date +%s%3N)
+      - name: Download Alpine Virt
+        run: |
+          curl -fL \
+            https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-virt-3.24.1-x86_64.iso \
+            -o alpine.iso
 
-    echo "QEMU elapsed: $((END - START)) ms"
+          sha256sum alpine.iso
+
+      - name: Boot Alpine with KVM
+        run: |
+          set -e
+
+          START=$(date +%s%N)
+
+          sudo timeout 15s \
+            qemu-system-x86_64 \
+            -accel kvm \
+            -cpu host \
+            -machine q35 \
+            -m 512M \
+            -smp 2 \
+            -cdrom alpine.iso \
+            -boot d \
+            -nographic \
+            -serial mon:stdio \
+            -no-reboot \
+            2>&1 | tee qemu.log || true
+
+          END=$(date +%s%N)
+
+          ELAPSED=$(( (END - START) / 1000000 ))
+
+          echo "================================"
+          echo "QEMU runtime: ${ELAPSED} ms"
+          echo "================================"
+
+      - name: Show boot log
+        if: always()
+        run: |
+          cat qemu.log
