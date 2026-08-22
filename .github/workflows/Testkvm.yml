@@ -1,0 +1,28 @@
+- name: Run Alpine on QEMU/KVM
+  shell: bash
+  run: |
+    set -euxo pipefail
+
+    sudo apt-get update
+    sudo apt-get install -y qemu-system-x86 qemu-utils curl
+
+    curl -L -o alpine.iso \
+      https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-virt-3.22.0-x86_64.iso
+
+    START=$(date +%s%3N)
+
+    sudo timeout 30s qemu-system-x86_64 \
+      -enable-kvm \
+      -cpu host \
+      -m 512 \
+      -smp 2 \
+      -drive file=alpine.qcow2,if=virtio,format=qcow2 \
+      -cdrom alpine.iso \
+      -nographic \
+      -serial mon:stdio \
+      -no-reboot \
+      -accel kvm
+
+    END=$(date +%s%3N)
+
+    echo "QEMU elapsed: $((END - START)) ms"
