@@ -1,4 +1,4 @@
-name: Android-x86 9 VM + KVM + noVNC
+name: Android-x86 9 VM
 
 on:
   workflow_dispatch:
@@ -6,45 +6,60 @@ on:
 jobs:
   android-x86:
     runs-on: ubuntu-24.04
-
-    # GitHub-hosted runner มีเพดาน job ประมาณ 6 ชั่วโมง
     timeout-minutes: 360
 
     steps:
-      - name: Check runner
-        shell: bash
-        run: |
-          set -eux
-          uname -a
-          lscpu | head -40
-          free -h
-          df -h
 
-      - name: Check KVM
+      # ============================================================
+      # 1. CHECK KVM
+      # ============================================================
+      - name: Check and enable KVM
         shell: bash
         run: |
           set -eux
 
-          echo "Checking /dev/kvm..."
+          echo "=== CPU ==="
+          lscpu
+
+          echo
+          echo "=== KVM ==="
           ls -l /dev/kvm
 
           if [ ! -e /dev/kvm ]; then
-            echo "ERROR: /dev/kvm is not available."
-            echo "GitHub-hosted nested virtualization is not guaranteed."
+            echo "ERROR: /dev/kvm does not exist"
             exit 1
           fi
+
+          echo "Fixing KVM permissions..."
+
+          sudo chgrp kvm /dev/kvm || true
+          sudo chmod 666 /dev/kvm
+
+          echo
+          echo "=== KVM permissions after fix ==="
+          ls -l /dev/kvm
 
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo "ERROR: /dev/kvm exists but is not accessible."
+            echo "ERROR: /dev/kvm still cannot be accessed"
             exit 1
           fi
 
-          sudo apt-get update
-          sudo apt-get install -y cpu-checker
+          echo "KVM device is accessible"
 
-          kvm-ok || true
+          # Directly test opening /dev/kvm
+          python3 - <<'PY'
+          import os
 
-      - name: Install QEMU and tools
+          fd = os.open("/dev/kvm", os.O_RDWR)
+          print("SUCCESS: /dev/kvm opened")
+          os.close(fd)
+          PY
+
+
+      # ============================================================
+      # 2. INSTALL PACKAGES
+      # ============================================================
+      - name: Install QEMU and dependencies
         shell: bash
         run: |
           set -eux
@@ -55,41 +70,58 @@ jobs:
             qemu-system-x86 \
             qemu-utils \
             qemu-kvm \
-            git \
             wget \
             curl \
+            git \
+            unzip \
             python3 \
             python3-pip \
-            unzip
+            netcat-openbsd
 
+          echo
+          echo "=== QEMU VERSION ==="
+          qemu-system-x86_64 --version
+
+          echo
+          echo "=== QEMU KVM SUPPORT ==="
+          qemu-system-x86_64 -accel help
+
+
+      # ============================================================
+      # 3. DOWNLOAD ANDROID-X86
+      # ============================================================
       - name: Download Android-x86 9.0-r2
         shell: bash
         run: |
           set -eux
 
-          wget -O android-x86.iso \
+          wget \
+            -O android-x86.iso \
             "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download"
 
-          echo "Downloaded:"
           ls -lh android-x86.iso
 
-          echo "SHA1:"
+          echo
+          echo "=== SHA1 ==="
           sha1sum android-x86.iso
 
           EXPECTED="1cc85b5ed7c830ff71aecf8405c7281a9c995aa0"
-
           ACTUAL="$(sha1sum android-x86.iso | awk '{print $1}')"
 
           if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "ERROR: Android-x86 ISO checksum mismatch"
+            echo "ERROR: ISO checksum mismatch"
             echo "Expected: $EXPECTED"
             echo "Actual:   $ACTUAL"
             exit 1
           fi
 
-          echo "Checksum OK"
+          echo "Android-x86 ISO checksum OK"
 
-      - name: Create Android disk
+
+      # ============================================================
+      # 4. CREATE VIRTUAL DISK
+      # ============================================================
+      - name: Create Android virtual disk
         shell: bash
         run: |
           set -eux
@@ -101,12 +133,14 @@ jobs:
 
           qemu-img info android-x86.qcow2
 
+
+      # ============================================================
+      # 5. INSTALL NOVNC
+      # ============================================================
       - name: Install noVNC
         shell: bash
         run: |
           set -eux
-
-          rm -rf noVNC
 
           git clone \
             --depth 1 \
@@ -115,25 +149,33 @@ jobs:
 
           cd noVNC
 
-          python3 -m pip install --user websockify
+          python3 -m pip install \
+            --user \
+            websockify
 
           chmod +x utils/novnc_proxy
 
           cd ..
 
           echo "noVNC installed"
-          ./noVNC/utils/novnc_proxy --help | head -30
 
-      - name: Start Android-x86 QEMU
+
+      # ============================================================
+      # 6. START QEMU
+      # ============================================================
+      - name: Start Android-x86
         shell: bash
         run: |
           set -eux
 
           rm -f qemu.log
+          rm -f qemu.pid
+
+          echo "Starting Android-x86 with KVM..."
 
           qemu-system-x86_64 \
             -enable-kvm \
-            -machine accel=kvm \
+            -machine type=q35,accel=kvm \
             -cpu host \
             -smp 4 \
             -m 4096 \
@@ -143,7 +185,6 @@ jobs:
             -vga virtio \
             -device virtio-keyboard-pci \
             -device virtio-mouse-pci \
-            -audiodev driver=none,id=noaudio \
             -display none \
             -vnc 127.0.0.1:0 \
             -daemonize \
@@ -152,37 +193,68 @@ jobs:
 
           sleep 5
 
+          echo
+          echo "=== QEMU PROCESS ==="
+          ps aux | grep '[q]emu-system-x86_64' || true
+
+          echo
+          echo "=== QEMU LOG ==="
+          cat qemu.log || true
+
+          if [ ! -f qemu.pid ]; then
+            echo "ERROR: QEMU did not start"
+            exit 1
+          fi
+
           if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
-            echo "QEMU failed to start"
+            echo "ERROR: QEMU process died"
             cat qemu.log || true
             exit 1
           fi
 
-          echo "QEMU started"
-          echo "VNC: 127.0.0.1:5900"
+          echo
+          echo "QEMU started successfully"
+          echo "VNC = 127.0.0.1:5900"
 
-      - name: Check VNC
+
+      # ============================================================
+      # 7. WAIT FOR VNC
+      # ============================================================
+      - name: Wait for VNC
         shell: bash
         run: |
           set -eux
 
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 5900 2>/dev/null; then
-              echo "VNC port 5900 is ready"
+          echo "Waiting for QEMU VNC..."
+
+          for i in $(seq 1 60); do
+
+            if nc -z 127.0.0.1 5900; then
+              echo "VNC is ready"
               exit 0
             fi
+
+            echo "Waiting... $i/60"
 
             sleep 2
           done
 
-          echo "VNC did not start"
+          echo "ERROR: VNC did not start"
+
           cat qemu.log || true
+
           exit 1
 
+
+      # ============================================================
+      # 8. START NOVNC
+      # ============================================================
       - name: Start noVNC
         shell: bash
         run: |
           set -eux
+
+          export PATH="$HOME/.local/bin:$PATH"
 
           ./noVNC/utils/novnc_proxy \
             --vnc 127.0.0.1:5900 \
@@ -193,28 +265,43 @@ jobs:
 
           sleep 5
 
+          echo
+          echo "=== noVNC LOG ==="
+
           cat novnc.log || true
 
-          if ! nc -z 127.0.0.1 6080 2>/dev/null; then
-            echo "noVNC did not start"
+          if ! nc -z 127.0.0.1 6080; then
+            echo "ERROR: noVNC did not start"
             exit 1
           fi
 
-          echo "noVNC ready on 6080"
+          echo
+          echo "noVNC is ready"
+          echo "Local address:"
+          echo "http://127.0.0.1:6080/vnc.html"
 
-      - name: Install cloudflared
+
+      # ============================================================
+      # 9. INSTALL CLOUDFLARED
+      # ============================================================
+      - name: Install Cloudflare Tunnel
         shell: bash
         run: |
           set -eux
 
-          wget -O cloudflared \
-            "https://github.com/cloudflare/cloudflared/releases/download/2026.5.2/cloudflared-linux-amd64"
+          wget \
+            -O cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
 
           chmod +x cloudflared
 
           ./cloudflared version
 
-      - name: Start Cloudflare Quick Tunnel
+
+      # ============================================================
+      # 10. START CLOUDFLARE QUICK TUNNEL
+      # ============================================================
+      - name: Start Cloudflare Tunnel
         shell: bash
         run: |
           set -eux
@@ -227,60 +314,126 @@ jobs:
 
           echo $! > cloudflared.pid
 
+          echo
           echo "Waiting for Cloudflare URL..."
 
-          for i in {1..60}; do
-            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -1; then
+          URL=""
+
+          for i in $(seq 1 60); do
+
+            URL=$(grep -Eo \
+              'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+              cloudflared.log \
+              | head -1 || true)
+
+            if [ -n "$URL" ]; then
               break
             fi
 
             sleep 2
+
           done
 
           echo
-          echo "============================================"
-          echo "            ANDROID-x86 WEB URL"
-          echo "============================================"
-
-          URL="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)"
+          echo "=================================================="
+          echo "          ANDROID-x86 WEB ACCESS"
+          echo "=================================================="
 
           if [ -z "$URL" ]; then
-            echo "Could not find Cloudflare URL"
+            echo "ERROR: Cloudflare URL not found"
+            echo
             cat cloudflared.log
             exit 1
           fi
 
+          echo
+          echo "OPEN THIS URL:"
+          echo
           echo "$URL/vnc.html"
+          echo
+          echo "=================================================="
+
+          echo "$URL/vnc.html" > novnc-url.txt
+
+
+      # ============================================================
+      # 11. SHOW STATUS
+      # ============================================================
+      - name: Show VM status
+        shell: bash
+        run: |
+          set -eux
+
+          echo
+          echo "================ VM STATUS ================"
+
+          echo
+          echo "--- KVM ---"
+          ls -l /dev/kvm
+
+          echo
+          echo "--- QEMU ---"
+          ps aux | grep '[q]emu-system-x86_64' || true
+
+          echo
+          echo "--- noVNC ---"
+          ps aux | grep '[n]ovnc_proxy' || true
+
+          echo
+          echo "--- Cloudflare ---"
+          ps aux | grep '[c]loudflared' || true
+
+          echo
+          echo "--- Ports ---"
+          ss -lntp || true
+
+          echo
+          echo "--- URL ---"
+          cat novnc-url.txt || true
 
           echo
           echo "============================================"
-          echo "Open this URL in your browser:"
-          echo "$URL/vnc.html"
-          echo "============================================"
 
-      - name: Keep VM alive
+
+      # ============================================================
+      # 12. KEEP RUNNING
+      # ============================================================
+      - name: Keep Android VM alive
         shell: bash
         run: |
           set -eux
 
           echo
           echo "Android-x86 is running."
-          echo "The browser URL is shown above."
           echo
-          echo "Press Ctrl+C is not possible here;"
-          echo "the workflow will remain alive until timeout."
+          echo "Web URL:"
+          cat novnc-url.txt
+          echo
+          echo "Keep this workflow running."
+          echo "Maximum runtime is limited by GitHub Actions."
 
           while true; do
+
             echo
+            echo "======================================"
             date
+
+            echo
             echo "--- QEMU ---"
             ps aux | grep '[q]emu-system-x86_64' || true
 
+            echo
             echo "--- noVNC ---"
             ps aux | grep '[n]ovnc_proxy' || true
 
+            echo
             echo "--- Cloudflare ---"
-            ps aux | grep '[c]loudflared tunnel' || true
+            ps aux | grep '[c]loudflared' || true
+
+            echo
+            echo "--- URL ---"
+            cat novnc-url.txt || true
 
             sleep 60
+
           done
