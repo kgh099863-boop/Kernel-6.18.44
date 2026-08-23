@@ -1,62 +1,286 @@
-name: Alpine KVM Boot Benchmark
+name: Android-x86 9 VM + KVM + noVNC
 
 on:
   workflow_dispatch:
 
 jobs:
-  boot:
-    runs-on: ubuntu-latest
+  android-x86:
+    runs-on: ubuntu-24.04
+
+    # GitHub-hosted runner มีเพดาน job ประมาณ 6 ชั่วโมง
+    timeout-minutes: 360
 
     steps:
-      - name: Check KVM
+      - name: Check runner
+        shell: bash
         run: |
           set -eux
-          test -e /dev/kvm
+          uname -a
+          lscpu | head -40
+          free -h
+          df -h
+
+      - name: Check KVM
+        shell: bash
+        run: |
+          set -eux
+
+          echo "Checking /dev/kvm..."
           ls -l /dev/kvm
+
+          if [ ! -e /dev/kvm ]; then
+            echo "ERROR: /dev/kvm is not available."
+            echo "GitHub-hosted nested virtualization is not guaranteed."
+            exit 1
+          fi
+
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "ERROR: /dev/kvm exists but is not accessible."
+            exit 1
+          fi
+
+          sudo apt-get update
+          sudo apt-get install -y cpu-checker
+
           kvm-ok || true
 
-      - name: Install QEMU
+      - name: Install QEMU and tools
+        shell: bash
         run: |
+          set -eux
+
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils
 
-      - name: Download Alpine Virt
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            qemu-kvm \
+            git \
+            wget \
+            curl \
+            python3 \
+            python3-pip \
+            unzip
+
+      - name: Download Android-x86 9.0-r2
+        shell: bash
         run: |
-          curl -fL \
-            https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/alpine-virt-3.24.1-x86_64.iso \
-            -o alpine.iso
+          set -eux
 
-          sha256sum alpine.iso
+          wget -O android-x86.iso \
+            "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download"
 
-      - name: Boot Alpine with KVM
+          echo "Downloaded:"
+          ls -lh android-x86.iso
+
+          echo "SHA1:"
+          sha1sum android-x86.iso
+
+          EXPECTED="1cc85b5ed7c830ff71aecf8405c7281a9c995aa0"
+
+          ACTUAL="$(sha1sum android-x86.iso | awk '{print $1}')"
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: Android-x86 ISO checksum mismatch"
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $ACTUAL"
+            exit 1
+          fi
+
+          echo "Checksum OK"
+
+      - name: Create Android disk
+        shell: bash
         run: |
-          set -e
+          set -eux
 
-          START=$(date +%s%N)
+          qemu-img create \
+            -f qcow2 \
+            android-x86.qcow2 \
+            16G
 
-          sudo timeout 15s \
-            qemu-system-x86_64 \
-            -accel kvm \
+          qemu-img info android-x86.qcow2
+
+      - name: Install noVNC
+        shell: bash
+        run: |
+          set -eux
+
+          rm -rf noVNC
+
+          git clone \
+            --depth 1 \
+            --branch v1.7.0 \
+            https://github.com/novnc/noVNC.git
+
+          cd noVNC
+
+          python3 -m pip install --user websockify
+
+          chmod +x utils/novnc_proxy
+
+          cd ..
+
+          echo "noVNC installed"
+          ./noVNC/utils/novnc_proxy --help | head -30
+
+      - name: Start Android-x86 QEMU
+        shell: bash
+        run: |
+          set -eux
+
+          rm -f qemu.log
+
+          qemu-system-x86_64 \
+            -enable-kvm \
+            -machine accel=kvm \
             -cpu host \
-            -machine q35 \
-            -m 512M \
-            -smp 2 \
-            -cdrom alpine.iso \
+            -smp 4 \
+            -m 4096 \
+            -drive file=android-x86.qcow2,format=qcow2,if=virtio \
+            -cdrom android-x86.iso \
             -boot d \
-            -nographic \
-            -serial mon:stdio \
-            -no-reboot \
-            2>&1 | tee qemu.log || true
+            -vga virtio \
+            -device virtio-keyboard-pci \
+            -device virtio-mouse-pci \
+            -audiodev driver=none,id=noaudio \
+            -display none \
+            -vnc 127.0.0.1:0 \
+            -daemonize \
+            -pidfile qemu.pid \
+            -D qemu.log
 
-          END=$(date +%s%N)
+          sleep 5
 
-          ELAPSED=$(( (END - START) / 1000000 ))
+          if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+            echo "QEMU failed to start"
+            cat qemu.log || true
+            exit 1
+          fi
 
-          echo "================================"
-          echo "QEMU runtime: ${ELAPSED} ms"
-          echo "================================"
+          echo "QEMU started"
+          echo "VNC: 127.0.0.1:5900"
 
-      - name: Show boot log
-        if: always()
+      - name: Check VNC
+        shell: bash
         run: |
-          cat qemu.log
+          set -eux
+
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+              echo "VNC port 5900 is ready"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "VNC did not start"
+          cat qemu.log || true
+          exit 1
+
+      - name: Start noVNC
+        shell: bash
+        run: |
+          set -eux
+
+          ./noVNC/utils/novnc_proxy \
+            --vnc 127.0.0.1:5900 \
+            --listen 6080 \
+            > novnc.log 2>&1 &
+
+          echo $! > novnc.pid
+
+          sleep 5
+
+          cat novnc.log || true
+
+          if ! nc -z 127.0.0.1 6080 2>/dev/null; then
+            echo "noVNC did not start"
+            exit 1
+          fi
+
+          echo "noVNC ready on 6080"
+
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -eux
+
+          wget -O cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/download/2026.5.2/cloudflared-linux-amd64"
+
+          chmod +x cloudflared
+
+          ./cloudflared version
+
+      - name: Start Cloudflare Quick Tunnel
+        shell: bash
+        run: |
+          set -eux
+
+          rm -f cloudflared.log
+
+          ./cloudflared tunnel \
+            --url http://127.0.0.1:6080 \
+            > cloudflared.log 2>&1 &
+
+          echo $! > cloudflared.pid
+
+          echo "Waiting for Cloudflare URL..."
+
+          for i in {1..60}; do
+            if grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -1; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          echo
+          echo "============================================"
+          echo "            ANDROID-x86 WEB URL"
+          echo "============================================"
+
+          URL="$(grep -Eo 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' cloudflared.log | head -1 || true)"
+
+          if [ -z "$URL" ]; then
+            echo "Could not find Cloudflare URL"
+            cat cloudflared.log
+            exit 1
+          fi
+
+          echo "$URL/vnc.html"
+
+          echo
+          echo "============================================"
+          echo "Open this URL in your browser:"
+          echo "$URL/vnc.html"
+          echo "============================================"
+
+      - name: Keep VM alive
+        shell: bash
+        run: |
+          set -eux
+
+          echo
+          echo "Android-x86 is running."
+          echo "The browser URL is shown above."
+          echo
+          echo "Press Ctrl+C is not possible here;"
+          echo "the workflow will remain alive until timeout."
+
+          while true; do
+            echo
+            date
+            echo "--- QEMU ---"
+            ps aux | grep '[q]emu-system-x86_64' || true
+
+            echo "--- noVNC ---"
+            ps aux | grep '[n]ovnc_proxy' || true
+
+            echo "--- Cloudflare ---"
+            ps aux | grep '[c]loudflared tunnel' || true
+
+            sleep 60
+          done
